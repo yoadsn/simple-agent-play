@@ -25,6 +25,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, Interrupt, interrupt
 
 from llm import ModelName, get_open_router_chat_model
+from state_log import dump_messages_to_file
 
 checkpointer = MemorySaver()
 llm = get_open_router_chat_model(ModelName.OR_GEMINI_2_0_FLASH_MODEL_NAME)
@@ -36,7 +37,7 @@ async def send_message(
 ) -> str:
     """Send a message to a person."""
     message_from_ai = f"you->{recipient}: {message}"
-    state["user_messages"][recipient].append(message_from_ai)
+    state["conversations"][recipient].append(message_from_ai)
     print(message_from_ai)
     return f"Message sent to {recipient}"
 
@@ -46,7 +47,11 @@ tools_by_name = {tool.name: tool for tool in tools}
 
 
 @task
-def get_user_message() -> HumanMessage:
+def dump_messages(messages: list[BaseMessage]):
+    dump_messages_to_file(messages)
+
+
+async def get_user_message() -> HumanMessage:
     """Get user message."""
     user_message_request = interrupt({"action": "get_user_message"})
     if not user_message_request:
@@ -66,36 +71,40 @@ async def call_tool(tool_call, state: dict, config: RunnableConfig):
     tool = tools_by_name[tool_call["name"]]
     args = {**tool_call["args"], "config": config, "state": state}
     observation = await tool.ainvoke(args)
-    return ToolMessage(content=observation, tool_call_id=tool_call["id"])
+    return {
+        "tool_message": ToolMessage(content=observation, tool_call_id=tool_call["id"]),
+        "next_state": state,
+    }
 
 
-# entrypoint(checkpointer)(run_agent)
+# entrypoint
 async def run_agent(
     input_state: dict[any, any], previous: dict[any, any], config: RunnableConfig
 ):
     state = {}
 
     system_message = SystemMessage(
-        content="""You are speaking to multiple users at the same time - use tools to communicate with each user.
+        content=f"""You are speaking to multiple users at the same time.
 You always have all history of conversations so you can reply in continuation to them.
+If you reply to the user - you must use the {send_message.name} tool.
 """
     )
 
-    user_messages = defaultdict(list)
-    state["user_messages"] = user_messages
+    state["conversations"] = {}
 
     while True:
-        conversations = []
-        for user in user_messages.keys():
-            all_messages_in_convo = "\n".join(user_messages[user])
+        conversation_strs = []
+        conversations = state["conversations"]
+        for user in conversations.keys():
+            all_messages_in_convo = "\n".join(conversations[user])
             conversation_with_user = f"""
 <{user}>
 {all_messages_in_convo}
 </{user}>
 """
-            conversations.append(conversation_with_user)
+            conversation_strs.append(conversation_with_user)
 
-        conversations_str = "\n".join(conversations)
+        conversations_str = "\n".join(conversation_strs)
 
         # Get user message
         user_message_request = await get_user_message()
@@ -104,19 +113,27 @@ You always have all history of conversations so you can reply in continuation to
 
         this_user = user_message_request["from"]
         this_message = user_message_request["message"]
-        this_user_messages = user_messages[this_user]
+
+        if this_user not in conversations:
+            conversations[this_user] = []
+        this_user_messages = conversations[this_user]
         this_user_messages.append(f"{this_user}->You: {this_message}")
 
         next_llm_input = f"""Here are all the active conversations:
 {conversations_str or "No conversations yet."}
 
-Last message from user {this_user}:
+You got a message from {this_user}:
+---
 {this_message}
 
-You must reply to the user with the tool.
+---
+Please reply.
 """
 
         messages = [system_message, HumanMessage(content=next_llm_input)]
+
+        await dump_messages(messages)
+
         llm_response = await call_model(messages)
         while True:
             if not llm_response.tool_calls:
@@ -125,8 +142,10 @@ You must reply to the user with the tool.
             # Execute tools
             tool_results = []
             for tool_call in llm_response.tool_calls:
-                tool_result = await call_tool(tool_call, state)
+                call_results = await call_tool(tool_call, state)
+                tool_result = call_results["tool_message"]
                 tool_results.append(tool_result)
+                state = call_results["next_state"]
 
             # Append to message list
             new_messages = [llm_response, *tool_results]
