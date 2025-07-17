@@ -26,7 +26,7 @@ from langgraph.types import Command, Interrupt, interrupt
 
 from checpoint_storage import get_checkpointer, setup_checkpointer_db
 from llm import ModelName, get_open_router_chat_model
-from state_log import dump_messages_to_file
+from state_log import dump_conversation_history_to_file, dump_messages_to_file
 from utils import run_async
 
 llm = get_open_router_chat_model(ModelName.OR_GEMINI_2_0_FLASH_MODEL_NAME)
@@ -52,10 +52,15 @@ def dump_messages(messages: list[BaseMessage]):
     dump_messages_to_file(messages)
 
 
+@task
+def dump_conversation_history(state: dict):
+    dump_conversation_history_to_file(state)
+
+
 async def get_user_message() -> HumanMessage:
     """Get user message."""
     user_message_request = interrupt({"action": "get_user_message"})
-    if not user_message_request:
+    if "from" not in user_message_request:
         return None
     return user_message_request
 
@@ -78,6 +83,31 @@ async def call_tool(tool_call, state: dict, config: RunnableConfig):
     }
 
 
+def get_next_llm_input(this_user, this_message, conversations):
+    conversation_strs = []
+    for user in conversations.keys():
+        all_messages_in_convo = "\n".join(conversations[user])
+        conversation_with_user = f"""
+<{user}>
+{all_messages_in_convo}
+</{user}>
+"""
+        conversation_strs.append(conversation_with_user)
+
+    conversations_str = "\n".join(conversation_strs)
+
+    next_llm_input = f"""Here are all the active conversations:
+{conversations_str or "No conversations yet."}
+You got a message from {this_user}:
+---
+{this_message}
+---
+Please reply.
+"""
+
+    return next_llm_input
+
+
 # entrypoint
 async def run_agent(
     input_state: dict[any, any], previous: dict[any, any], config: RunnableConfig
@@ -94,18 +124,7 @@ If you reply to the user - you must use the {send_message.name} tool.
     state["conversations"] = {}
 
     while True:
-        conversation_strs = []
-        conversations = state["conversations"]
-        for user in conversations.keys():
-            all_messages_in_convo = "\n".join(conversations[user])
-            conversation_with_user = f"""
-<{user}>
-{all_messages_in_convo}
-</{user}>
-"""
-            conversation_strs.append(conversation_with_user)
-
-        conversations_str = "\n".join(conversation_strs)
+        await dump_conversation_history(state)
 
         # Get user message
         user_message_request = await get_user_message()
@@ -115,21 +134,14 @@ If you reply to the user - you must use the {send_message.name} tool.
         this_user = user_message_request["from"]
         this_message = user_message_request["message"]
 
+        conversations = state["conversations"]
         if this_user not in conversations:
             conversations[this_user] = []
+
+        next_llm_input = get_next_llm_input(this_user, this_message, conversations)
+
         this_user_messages = conversations[this_user]
         this_user_messages.append(f"{this_user}->You: {this_message}")
-
-        next_llm_input = f"""Here are all the active conversations:
-{conversations_str or "No conversations yet."}
-
-You got a message from {this_user}:
----
-{this_message}
-
----
-Please reply.
-"""
 
         messages = [system_message, HumanMessage(content=next_llm_input)]
 
@@ -166,7 +178,12 @@ def get_input_for_interrupt(interrupt: Interrupt):
         if interrupt.value["action"] == "get_user_message":
             user_from = input("Who: ")
             user_message = input("Msg: ")
-            next_input = Command(resume={"from": user_from, "message": user_message})
+            if not user_from or not user_message:
+                next_input = Command(resume={"end": True})
+            else:
+                next_input = Command(
+                    resume={"from": user_from, "message": user_message}
+                )
 
         else:
             raise ValueError(f"Unknown interrupt action: {interrupt.value}")
@@ -190,16 +207,14 @@ async def start(thread_id: str):
     async with get_checkpointer() as checkpointer:
         runnable_pregel = entrypoint(checkpointer)(run_agent)
 
-        last_state = await runnable_pregel.aget_state(config)
-        if last_state.interrupts:
-            first_interrupt: Interrupt = last_state.interrupts[0]
-            next_input = get_input_for_interrupt(first_interrupt)
-
         while True:
-            result = await runnable_pregel.ainvoke(next_input, config)
-            if "__interrupt__" in result:
-                first_interrupt: Interrupt = result["__interrupt__"][0]
+            last_state = await runnable_pregel.aget_state(config)
+            if last_state.interrupts:
+                first_interrupt: Interrupt = last_state.interrupts[0]
                 next_input = get_input_for_interrupt(first_interrupt)
+            result = await runnable_pregel.ainvoke(next_input, config)
+            if result == "done":
+                break
 
 
 @click.command()
