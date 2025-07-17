@@ -1,0 +1,172 @@
+import asyncio
+import uuid
+from collections import defaultdict
+from email import message
+from encodings import raw_unicode_escape
+from multiprocessing import Value
+from typing import Annotated
+
+from langchain.tools import tool
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolCall,
+    ToolMessage,
+)
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import InjectedToolArg
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.func import entrypoint, task
+from langgraph.graph.message import add_messages
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, Interrupt, interrupt
+
+from llm import ModelName, get_open_router_chat_model
+
+checkpointer = MemorySaver()
+llm = get_open_router_chat_model(ModelName.OR_GEMINI_2_0_FLASH_MODEL_NAME)
+
+
+@tool
+async def send_message(
+    recipient: str, message: str, state: Annotated[dict, InjectedToolArg]
+) -> str:
+    """Send a message to a person."""
+    message_from_ai = f"you->{recipient}: {message}"
+    state["user_messages"][recipient].append(message_from_ai)
+    print(message_from_ai)
+    return f"Message sent to {recipient}"
+
+
+tools = [send_message]
+tools_by_name = {tool.name: tool for tool in tools}
+
+
+@task
+def get_user_message() -> HumanMessage:
+    """Get user message."""
+    user_message_request = interrupt({"action": "get_user_message"})
+    if not user_message_request:
+        return None
+    return user_message_request
+
+
+@task
+def call_model(messages) -> BaseMessage:
+    """Call model with a sequence of messages."""
+    response = llm.bind_tools(tools).invoke(messages)
+    return response
+
+
+@task
+async def call_tool(tool_call, state: dict, config: RunnableConfig):
+    tool = tools_by_name[tool_call["name"]]
+    args = {**tool_call["args"], "config": config, "state": state}
+    observation = await tool.ainvoke(args)
+    return ToolMessage(content=observation, tool_call_id=tool_call["id"])
+
+
+# entrypoint(checkpointer)(run_agent)
+async def run_agent(
+    input_state: dict[any, any], previous: dict[any, any], config: RunnableConfig
+):
+    state = {}
+
+    system_message = SystemMessage(
+        content="""You are speaking to multiple users at the same time - use tools to communicate with each user.
+You always have all history of conversations so you can reply in continuation to them.
+"""
+    )
+
+    user_messages = defaultdict(list)
+    state["user_messages"] = user_messages
+
+    while True:
+        conversations = []
+        for user in user_messages.keys():
+            all_messages_in_convo = "\n".join(user_messages[user])
+            conversation_with_user = f"""
+<{user}>
+{all_messages_in_convo}
+</{user}>
+"""
+            conversations.append(conversation_with_user)
+
+        conversations_str = "\n".join(conversations)
+
+        # Get user message
+        user_message_request = await get_user_message()
+        if not user_message_request:
+            break
+
+        this_user = user_message_request["from"]
+        this_message = user_message_request["message"]
+        this_user_messages = user_messages[this_user]
+        this_user_messages.append(f"{this_user}->You: {this_message}")
+
+        next_llm_input = f"""Here are all the active conversations:
+{conversations_str or "No conversations yet."}
+
+Last message from user {this_user}:
+{this_message}
+
+You must reply to the user with the tool.
+"""
+
+        messages = [system_message, HumanMessage(content=next_llm_input)]
+        llm_response = await call_model(messages)
+        while True:
+            if not llm_response.tool_calls:
+                break
+
+            # Execute tools
+            tool_results = []
+            for tool_call in llm_response.tool_calls:
+                tool_result = await call_tool(tool_call, state)
+                tool_results.append(tool_result)
+
+            # Append to message list
+            new_messages = [llm_response, *tool_results]
+            # for msg in new_messages:
+            #     print(msg.pretty_print())
+            messages = add_messages(messages, new_messages)
+
+            # Call model again
+            llm_response = await call_model(messages)
+
+    return "done"
+
+
+async def start():
+    input_state = {}
+    config = {
+        "configurable": {
+            "thread_id": str(uuid.uuid4()),
+        }
+    }
+    runnable_pregel = entrypoint(checkpointer)(run_agent)
+
+    next_input = input_state
+    while True:
+        result = await runnable_pregel.ainvoke(next_input, config)
+        if "__interrupt__" in result:
+            first_interrupt: Interrupt = result["__interrupt__"][0]
+            if first_interrupt.resumable:
+                if first_interrupt.value["action"] == "get_user_message":
+                    user_from = input("Who: ")
+                    user_message = input("Msg: ")
+                    next_input = Command(
+                        resume={"from": user_from, "message": user_message}
+                    )
+
+                else:
+                    raise ValueError(
+                        f"Unknown interrupt action: {first_interrupt.value}"
+                    )
+
+
+if __name__ == "__main__":
+    asyncio.run(start())
