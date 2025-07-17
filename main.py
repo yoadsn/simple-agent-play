@@ -6,6 +6,7 @@ from encodings import raw_unicode_escape
 from multiprocessing import Value
 from typing import Annotated
 
+import click
 from langchain.tools import tool
 from langchain_core.messages import (
     AIMessage,
@@ -18,16 +19,16 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.func import entrypoint, task
 from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, Interrupt, interrupt
 
+from checpoint_storage import get_checkpointer, setup_checkpointer_db
 from llm import ModelName, get_open_router_chat_model
 from state_log import dump_messages_to_file
+from utils import run_async
 
-checkpointer = MemorySaver()
 llm = get_open_router_chat_model(ModelName.OR_GEMINI_2_0_FLASH_MODEL_NAME)
 
 
@@ -159,33 +160,61 @@ Please reply.
     return "done"
 
 
-async def start():
-    input_state = {}
+def get_input_for_interrupt(interrupt: Interrupt):
+    next_input = None
+    if interrupt.resumable:
+        if interrupt.value["action"] == "get_user_message":
+            user_from = input("Who: ")
+            user_message = input("Msg: ")
+            next_input = Command(resume={"from": user_from, "message": user_message})
+
+        else:
+            raise ValueError(f"Unknown interrupt action: {interrupt.value}")
+    return next_input
+
+
+@click.command()
+@click.option(
+    "--thread_id", default=None, help="Thread ID to run - or will use a random one"
+)
+@run_async
+async def start(thread_id: str):
+    next_input = {}
+    thread_id = thread_id or str(uuid.uuid4())
     config = {
         "configurable": {
-            "thread_id": str(uuid.uuid4()),
+            "thread_id": thread_id,
         }
     }
-    runnable_pregel = entrypoint(checkpointer)(run_agent)
 
-    next_input = input_state
-    while True:
-        result = await runnable_pregel.ainvoke(next_input, config)
-        if "__interrupt__" in result:
-            first_interrupt: Interrupt = result["__interrupt__"][0]
-            if first_interrupt.resumable:
-                if first_interrupt.value["action"] == "get_user_message":
-                    user_from = input("Who: ")
-                    user_message = input("Msg: ")
-                    next_input = Command(
-                        resume={"from": user_from, "message": user_message}
-                    )
+    async with get_checkpointer() as checkpointer:
+        runnable_pregel = entrypoint(checkpointer)(run_agent)
 
-                else:
-                    raise ValueError(
-                        f"Unknown interrupt action: {first_interrupt.value}"
-                    )
+        last_state = await runnable_pregel.aget_state(config)
+        if last_state.interrupts:
+            first_interrupt: Interrupt = last_state.interrupts[0]
+            next_input = get_input_for_interrupt(first_interrupt)
 
+        while True:
+            result = await runnable_pregel.ainvoke(next_input, config)
+            if "__interrupt__" in result:
+                first_interrupt: Interrupt = result["__interrupt__"][0]
+                next_input = get_input_for_interrupt(first_interrupt)
+
+
+@click.command()
+@run_async
+async def setup():
+    await setup_checkpointer_db()
+
+
+@click.group()
+def cli():
+    pass
+
+
+cli.add_command(start)
+cli.add_command(setup)
 
 if __name__ == "__main__":
-    asyncio.run(start())
+    cli()
